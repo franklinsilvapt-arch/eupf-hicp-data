@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build the HICP dataset used by the eupersonalfinance.eu inflation calculator.
 
-Reads Eurostat's bulk download files rather than the filtered query API. The API
-rejected the filtered request with a 400 and gives no useful detail about which
-parameter it disliked; the bulk files are a stable format that has been verified by
-hand against the series this calculator ships with.
+Reads Eurostat's SDMX 2.1 bulk endpoint. The older statistics/1.0 query API answers
+400 and the previous bulk download service answers 410 Gone, so both were dropped.
+The TSV format is the one verified by hand against the series this calculator ships
+with, which is why it is preferred over JSON-stat here.
 
   prc_hicp_ainr  annual average rate of change, the definitive figure for each
                  closed year. This is the backbone of the calculator.
@@ -34,12 +34,15 @@ START_YEAR = 1997
 OUT = pathlib.Path(__file__).resolve().parent.parent / "data" / "hicp-anual.json"
 TIMEOUT = 180
 
-# Eurostat has moved this endpoint before, so try the known forms in order.
+# Eurostat retired the old bulk download service (it answers 410 Gone) and the
+# statistics/1.0 query API with it. Everything now lives under SDMX 2.1. The forms
+# below are tried in order so a future move degrades to the next candidate instead
+# of taking the pipeline down.
 BULK_URLS = [
-    "https://ec.europa.eu/eurostat/api/dissemination/files?file=data%2F{ds}.tsv.gz",
-    "https://ec.europa.eu/eurostat/api/dissemination/files?file=data/{ds}.tsv.gz",
-    "https://ec.europa.eu/eurostat/estat-navtree-portlet-prod/BulkDownloadListing"
-    "?file=data%2F{ds}.tsv.gz",
+    "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{ds}?format=TSV&compressed=true",
+    "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{ds}/?format=TSV&compressed=true",
+    "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{ds}?format=TSV",
+    "https://ec.europa.eu/eurostat/api/dissemination/files/data/{ds}.tsv.gz",
 ]
 
 

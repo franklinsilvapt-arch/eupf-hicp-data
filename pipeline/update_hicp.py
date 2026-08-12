@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Build the HICP dataset used by the eupersonalfinance.eu inflation calculator.
 
-Two Eurostat datasets, two different jobs:
+Reads Eurostat's bulk download files rather than the filtered query API. The API
+rejected the filtered request with a 400 and gives no useful detail about which
+parameter it disliked; the bulk files are a stable format that has been verified by
+hand against the series this calculator ships with.
 
   prc_hicp_ainr  annual average rate of change, the definitive figure for each
                  closed year. This is the backbone of the calculator.
@@ -18,6 +21,7 @@ valid file with the annual series. A missing provisional year is a small loss; a
 broken JSON would take the calculator down.
 """
 
+import gzip
 import json
 import pathlib
 import sys
@@ -25,135 +29,126 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
 GEOS = {"EA": "Euro area", "NL": "Netherlands"}
 START_YEAR = 1997
 OUT = pathlib.Path(__file__).resolve().parent.parent / "data" / "hicp-anual.json"
-TIMEOUT = 60
+TIMEOUT = 180
+
+# Eurostat has moved this endpoint before, so try the known forms in order.
+BULK_URLS = [
+    "https://ec.europa.eu/eurostat/api/dissemination/files?file=data%2F{ds}.tsv.gz",
+    "https://ec.europa.eu/eurostat/api/dissemination/files?file=data/{ds}.tsv.gz",
+    "https://ec.europa.eu/eurostat/estat-navtree-portlet-prod/BulkDownloadListing"
+    "?file=data%2F{ds}.tsv.gz",
+]
 
 
-def fetch(dataset: str, params: dict) -> dict:
-    query = []
-    for key, value in params.items():
-        if isinstance(value, (list, tuple)):
-            query.extend(f"{key}={item}" for item in value)
-        else:
-            query.append(f"{key}={value}")
-    url = f"{BASE}/{dataset}?" + "&".join(query)
-    req = urllib.request.Request(url, headers={"User-Agent": "eupf-hicp-data"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def decode(js: dict) -> dict:
-    """Turn a JSON-stat response into {(dim value, ...): number}.
-
-    Eurostat returns values in a flat dict keyed by a single integer offset. The
-    offset is recovered from the dimension sizes, in the order given by id.
-    """
-    dim_ids = js["id"] if "id" in js else js["dimension"]["id"]
-    sizes = js["size"] if "size" in js else js["dimension"]["size"]
-
-    labels = []
-    for dim in dim_ids:
-        index = js["dimension"][dim]["category"]["index"]
-        if isinstance(index, list):
-            ordered = list(index)
-        else:
-            ordered = [None] * len(index)
-            for code, pos in index.items():
-                ordered[pos] = code
-        labels.append(ordered)
-
-    strides = [1] * len(sizes)
-    for i in range(len(sizes) - 2, -1, -1):
-        strides[i] = strides[i + 1] * sizes[i + 1]
-
-    out = {}
-    for flat, value in js.get("value", {}).items():
-        if value is None:
+def download_tsv(dataset: str) -> str:
+    """Fetch and unzip a bulk dataset, trying each known endpoint in turn."""
+    errors = []
+    for template in BULK_URLS:
+        url = template.format(ds=dataset)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "eupf-hicp-data"})
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            errors.append(f"{url} -> HTTP {exc.code} {body}")
             continue
-        rest = int(flat)
-        key = []
-        for dim_pos in range(len(sizes)):
-            idx, rest = divmod(rest, strides[dim_pos])
-            key.append(labels[dim_pos][idx])
-        out[tuple(key)] = float(value)
+        except Exception as exc:
+            errors.append(f"{url} -> {exc}")
+            continue
+
+        try:
+            text = gzip.decompress(raw).decode("utf-8")
+        except OSError:
+            text = raw.decode("utf-8", "replace")
+
+        # A stray HTML error page would decompress to nothing useful, so sanity check.
+        if "\t" not in text.split("\n", 1)[0]:
+            errors.append(f"{url} -> response is not a TSV")
+            continue
+        print(f"fetched {dataset} from {url}")
+        return text
+
+    raise RuntimeError("all bulk endpoints failed:\n  " + "\n  ".join(errors))
+
+
+def parse_tsv(text: str, freq: str, unit: str, coicop: str) -> dict:
+    """Return {geo: {period: value}} for the rows matching the given key.
+
+    Bulk files look like this, with the dimension key packed into the first column:
+
+        freq,unit,coicop,geo\\TIME_PERIOD	1996	1997	...
+        A,RCH_A_AVG,TOTAL,EA	:	1.6 	1.1 	...
+
+    Values carry observation flags such as a trailing 'p' for provisional, and ':'
+    marks a missing observation.
+    """
+    lines = text.strip().split("\n")
+    periods = [p.strip() for p in lines[0].split("\t")[1:]]
+
+    wanted = {geo: f"{freq},{unit},{coicop},{geo}" for geo in GEOS}
+    out = {geo: {} for geo in GEOS}
+
+    for line in lines[1:]:
+        if "\t" not in line:
+            continue
+        key, _, rest = line.partition("\t")
+        key = key.strip()
+        geo = next((g for g, k in wanted.items() if key == k), None)
+        if geo is None:
+            continue
+        for period, cell in zip(periods, rest.split("\t")):
+            cell = cell.strip()
+            if not cell or cell.startswith(":"):
+                continue
+            try:
+                out[geo][period] = float(cell.split(" ")[0])
+            except ValueError:
+                continue
     return out
 
 
-def position_of(js: dict, dim: str) -> int:
-    dim_ids = js["id"] if "id" in js else js["dimension"]["id"]
-    return dim_ids.index(dim)
-
-
 def annual_series() -> dict:
-    js = fetch(
-        "prc_hicp_ainr",
-        {
-            "format": "JSON",
-            "lang": "EN",
-            "unit": "RCH_A_AVG",
-            "coicop": "TOTAL",
-            "geo": list(GEOS),
-            "sinceTimePeriod": START_YEAR,
-        },
-    )
-    values = decode(js)
-    geo_pos = position_of(js, "geo")
-    time_pos = position_of(js, "time")
-
-    series = {geo: {} for geo in GEOS}
-    for key, value in values.items():
-        geo = key[geo_pos]
-        year = key[time_pos]
-        if geo in series:
-            series[geo][year] = round(value, 1)
-
-    for geo, data in series.items():
-        if not data:
-            raise RuntimeError(f"no annual data returned for {geo}")
+    raw = parse_tsv(download_tsv("prc_hicp_ainr"), "A", "RCH_A_AVG", "TOTAL")
+    series = {}
+    for geo, values in raw.items():
+        series[geo] = {
+            year: round(value, 1)
+            for year, value in values.items()
+            if year.isdigit() and int(year) >= START_YEAR
+        }
+        if not series[geo]:
+            raise RuntimeError(f"no annual data found for {geo}")
     return series
 
 
 def provisional(closed_years: dict) -> dict:
     """Mean of the monthly year on year rates already published for the open year."""
-    year = datetime.now(timezone.utc).year
-    js = fetch(
-        "prc_hicp_minr",
-        {
-            "format": "JSON",
-            "lang": "EN",
-            "unit": "RCH_A",
-            "coicop": "TOTAL",
-            "geo": list(GEOS),
-            "sinceTimePeriod": f"{year}-01",
-        },
-    )
-    values = decode(js)
-    geo_pos = position_of(js, "geo")
-    time_pos = position_of(js, "time")
-
-    months = {geo: [] for geo in GEOS}
-    for key, value in values.items():
-        geo = key[geo_pos]
-        if geo in months and key[time_pos].startswith(str(year)):
-            months[geo].append(value)
+    year = str(datetime.now(timezone.utc).year)
+    raw = parse_tsv(download_tsv("prc_hicp_minr"), "M", "RCH_A", "TOTAL")
 
     out = {}
-    for geo, vals in months.items():
+    for geo, values in raw.items():
         # Skip if the annual figure for this year is already final.
-        if str(year) in closed_years.get(geo, {}):
+        if year in closed_years.get(geo, {}):
             continue
-        if vals:
-            out[geo] = {str(year): round(sum(vals) / len(vals), 1), "months": len(vals)}
+        months = [v for period, v in values.items() if period.startswith(year + "-")]
+        if months:
+            out[geo] = {year: round(sum(months) / len(months), 1), "months": len(months)}
     return out
 
 
 def main() -> int:
     try:
         series = annual_series()
-    except (urllib.error.URLError, KeyError, ValueError, RuntimeError) as exc:
+    except Exception as exc:
         print(f"annual fetch failed: {exc}", file=sys.stderr)
         return 1
 
@@ -178,7 +173,7 @@ def main() -> int:
 
     for geo in GEOS:
         years = sorted(series[geo])
-        print(f"{geo}: {len(years)} years, {years[0]} to {years[-1]}")
+        print(f"{geo}: {len(years)} years, {years[0]} to {years[-1]}, latest {series[geo][years[-1]]}%")
     print(f"provisional: {prov or 'none'}")
     return 0
 

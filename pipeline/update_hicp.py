@@ -49,8 +49,11 @@ CBS_URL = (
     "?$select=Perioden,JaarmutatieCPI_1"
 )
 
-# PxWeb. IA001 is the annual change of the CPI, IA021 the monthly change.
-STAT_EE = "https://andmed.stat.ee/api/v1/et/stat/majandus__hinnad/{table}"
+# PxWeb. IA001 is the annual change of the CPI, IA021 the monthly change. The path to
+# a table is discovered by walking the API tree rather than copied from the browser
+# URL, which is not the same thing: guessing it returned 400 with no clue why.
+STAT_EE_ROOT = "https://andmed.stat.ee/api/v1/et"
+_px_paths = {}
 
 
 def fetch(url: str, payload: dict = None) -> bytes:
@@ -175,12 +178,59 @@ def netherlands() -> tuple:
 
 # ----------------------------------------------------------- Statistikaamet (EE)
 
+def px_children(url: str) -> list:
+    try:
+        data = json.loads(fetch(url).decode("utf-8"))
+    except Exception as exc:
+        print(f"  px: {url} -> {exc}", file=sys.stderr)
+        return []
+    return data if isinstance(data, list) else []
+
+
+def px_find_table(table: str) -> str:
+    """Walk the API tree until a table whose id starts with `table` turns up.
+
+    Only branches that look like the economy/prices part of the tree are followed, so
+    this costs three or four requests rather than a full crawl. The path is cached
+    because both tables we need live in the same branch.
+    """
+    if table in _px_paths:
+        return _px_paths[table]
+
+    hints = ("majandus", "hinnad", "economy", "prices")
+    frontier = []
+    for db in px_children(STAT_EE_ROOT):
+        dbid = db.get("dbid") or db.get("id")
+        if dbid:
+            frontier.append((f"{STAT_EE_ROOT}/{dbid}", 0))
+
+    while frontier:
+        url, depth = frontier.pop(0)
+        if depth > 3:
+            continue
+        for item in px_children(url):
+            item_id = item.get("id", "")
+            child = f"{url}/{item_id}"
+            if item.get("type") == "t":
+                if item_id.upper().startswith(table.upper()):
+                    print(f"px: found {table} at {child}")
+                    _px_paths[table] = child
+                    return child
+            elif item.get("type") == "l":
+                text = (item.get("text") or "").lower()
+                if depth == 0 or any(h in item_id.lower() or h in text for h in hints):
+                    frontier.append((child, depth + 1))
+
+    raise RuntimeError(f"table {table} not found in the Statistikaamet API tree")
+
+
 def px_fetch(table: str) -> dict:
     """PxWeb describes its own tables, so variable codes are discovered rather than
     hardcoded. Statistics agencies rename these, and a guess that silently selects
     the wrong series would be worse than a loud failure. The variables are printed
     so a future break can be diagnosed from the workflow log alone."""
-    meta = json.loads(fetch(STAT_EE.format(table=table)).decode("utf-8"))
+    url = px_find_table(table)
+    meta = json.loads(fetch(url).decode("utf-8"))
     described = [(v["code"], v.get("text", ""), len(v.get("values", [])))
                  for v in meta.get("variables", [])]
     print(f"{table} variables: {described}")
@@ -189,7 +239,7 @@ def px_fetch(table: str) -> dict:
                   for v in meta.get("variables", [])],
         "response": {"format": "json-stat2"},
     }
-    return json.loads(fetch(STAT_EE.format(table=table), payload).decode("utf-8"))
+    return json.loads(fetch(url, payload).decode("utf-8"))
 
 
 def jsonstat_rows(js: dict):

@@ -2,14 +2,16 @@
   "indicator": "Annual average rate of change of consumer prices (%)",
   "sources": {
     "EA": "Eurostat, HICP, prc_hicp_ainr and prc_hicp_minr, from 1997",
-    "NL": "CBS StatLine 70936ned, national CPI (jaarmutatie), from 1963"
+    "NL": "CBS StatLine 70936ned, national CPI (jaarmutatie), from 1963",
+    "EE": "Statistikaamet IA001 and IA021, national CPI (tarbijahinnaindeks)"
   },
-  "note": "EA is the euro area with changing composition. NL uses the CBS national CPI rather than the HICP because that is the figure quoted in the Netherlands; the two differ materially (2022: 10.0 vs 11.6). Provisional values are the mean of the months published so far in the current year.",
+  "note": "Each geography uses the index its own readers recognise rather than a single harmonised one. EA is the euro area with changing composition (HICP). NL and EE use their national CPI, which differs materially from the HICP (NL 2022: 10.0 vs 11.6). Provisional values are the mean of the months published so far in the current year.",
   "geos": {
     "EA": "Euro area",
-    "NL": "Netherlands"
+    "NL": "Netherlands",
+    "EE": "Estonia"
   },
-  "updated": "2026-08-13T11:02:02Z",
+  "updated": "2026-08-13T16:49:28Z",
   "series": {
     "EA": {
       "1997": 1.6,
@@ -106,6 +108,35 @@
       "2023": 3.8,
       "2024": 3.3,
       "2025": 3.3
+    },
+    "EE": {
+      "1999": 5.1,
+      "2000": 9.7,
+      "2001": 2.0,
+      "2002": 6.2,
+      "2003": 2.8,
+      "2004": 3.7,
+      "2005": 2.9,
+      "2006": 4.1,
+      "2007": 4.7,
+      "2008": 8.9,
+      "2009": 7.6,
+      "2010": 1.5,
+      "2011": 2.8,
+      "2012": 2.4,
+      "2013": 2.0,
+      "2014": 2.3,
+      "2015": 2.8,
+      "2016": 2.1,
+      "2017": 3.0,
+      "2018": 3.5,
+      "2019": 2.7,
+      "2020": 1.0,
+      "2021": 2.6,
+      "2022": 10.3,
+      "2023": 11.2,
+      "2024": 6.5,
+      "2025": 5.3
     }
   },
   "provisional": {
@@ -115,6 +146,10 @@
     },
     "NL": {
       "2026": 2.8,
+      "months": 7
+    },
+    "EE": {
+      "2026": 3.1,
       "months": 7
     }
   }

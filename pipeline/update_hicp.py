@@ -289,17 +289,63 @@ def pick_dimension(js: dict, needle: str):
     return None
 
 
+def px_pick_total(js: dict, time_dim: str) -> dict:
+    """Choose the 'all items' category for every non-time dimension.
+
+    IA001 publishes the annual change by commodity group, not just the overall
+    index. Reading it without filtering silently returns whichever group happens to
+    land last on each year, which is how this pipeline first shipped 2022 as 10.3%
+    when the published figure is 19.4%.
+    """
+    wanted = ("kokku", "koguindeks", "üldindeks", "uldindeks", "total", "koond")
+    chosen = {}
+    for dim in js["id"]:
+        if dim == time_dim:
+            continue
+        cat = js["dimension"][dim]["category"]
+        index = cat["index"]
+        codes = ([None] * len(index)) if isinstance(index, dict) else list(index)
+        if isinstance(index, dict):
+            for code, pos in index.items():
+                codes[pos] = code
+        label_map = cat.get("label") or {}
+
+        pick = None
+        for code in codes:
+            if any(w in str(label_map.get(code, code)).lower() for w in wanted):
+                pick = code
+                break
+        if pick is None:
+            pick = codes[0]          # PxWeb convention: the total comes first
+        chosen[dim] = pick
+        print(f"  {dim}: using '{label_map.get(pick, pick)}' out of {len(codes)} values")
+    return chosen
+
+
+# Published by Statistikaamet, used to prove the right series was read.
+EE_CHECKS = {"2022": 19.4, "2023": 9.2, "2025": 4.8}
+
+
 def estonia() -> tuple:
     js = px_fetch("IA001")
     time_dim = pick_dimension(js, "aasta") or js["id"][-1]
+    chosen = px_pick_total(js, time_dim)
 
     annual = {}
     for key, value in jsonstat_rows(js):
+        if any(key[dim][0] != code for dim, code in chosen.items()):
+            continue
         code = key[time_dim][0]
         if code.isdigit() and int(code) >= EE_START:
             annual[code] = round(value, 1)
     if not annual:
         raise RuntimeError("no annual data found for EE")
+
+    # Fail loudly rather than publish a plausible but wrong series.
+    wrong = {y: (annual.get(y), v) for y, v in EE_CHECKS.items()
+             if y in annual and abs(annual[y] - v) > 0.15}
+    if wrong:
+        raise RuntimeError(f"EE series does not match published figures: {wrong}")
 
     prov = {}
     try:
@@ -307,7 +353,8 @@ def estonia() -> tuple:
         if year not in annual:
             jm = px_fetch("IA021")
             time_dim_m = pick_dimension(jm, "aasta") or jm["id"][0]
-            ind_dim = pick_dimension(jm, "naitaja") or pick_dimension(jm, "n\u00e4itaja")
+            month_dim = pick_dimension(jm, "kuu")
+            ind_dim = pick_dimension(jm, "naitaja") or pick_dimension(jm, "näitaja")
             months = []
             for key, value in jsonstat_rows(jm):
                 if key[time_dim_m][0] != year:
@@ -317,13 +364,15 @@ def estonia() -> tuple:
                 # comparable with the annual figure.
                 if ind_dim and "eelmise aasta" not in str(key[ind_dim][1]).lower():
                     continue
+                if month_dim and not str(key[month_dim][0]):
+                    continue
                 months.append(value)
             if months:
                 prov = {year: round(sum(months) / len(months), 1), "months": len(months)}
     except Exception as exc:
         print(f"EE provisional skipped: {exc}", file=sys.stderr)
 
-    print("fetched EE from Statistikaamet IA001")
+    print(f"fetched EE from Statistikaamet IA001, checks passed")
     return annual, prov
 
 

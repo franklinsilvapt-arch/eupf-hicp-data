@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Build the inflation dataset used by the eupersonalfinance.eu inflation calculator.
+"""Build the inflation dataset used by the eupersonalfinance.eu and e-rahatarkus.ee
+inflation calculators.
 
-Two audiences, two indices, on purpose:
+Three audiences, three indices, on purpose. Each page uses the measure its own
+readers recognise, which matters more here than cross-border consistency:
 
-  EA  Euro area, Eurostat HICP (prc_hicp_ainr), annual average rate of change,
-      from 1997. The harmonised index is the right one for a pan-European page
-      because it is the only measure comparable across member states.
+  EA  Euro area, Eurostat HICP (prc_hicp_ainr), from 1997. The harmonised index is
+      the only one comparable across member states, which is the point of a
+      pan-European page.
 
-  NL  Netherlands, CBS national CPI (StatLine 70936ned), from 1963. This is the
-      figure Dutch media and Dutch competitors quote. It differs from the HICP by
-      more than rounding: 2022 reads 10.0% here and 11.6% in the HICP. On a page
-      written for Dutch readers, matching what they remember beats cross-border
-      comparability, and it buys 34 extra years of history.
+  NL  Netherlands, CBS national CPI (StatLine 70936ned), from 1963. The figure Dutch
+      media quote. It differs from the HICP by more than rounding: 2022 reads 10.0
+      here and 11.6 in the HICP.
+
+  EE  Estonia, Statistikaamet THI (tarbijahinnaindeks, tables IA001 and IA021). Same
+      reasoning: Estonian news quotes the THI, not the harmonised THHI.
 
 The current year is estimated from the months already published and flagged as
-provisional. That step is deliberately non-fatal: a missing provisional year is a
-small loss, a broken JSON would take the calculator down.
+provisional. That step is deliberately non-fatal per country: a missing provisional
+year is a small loss, a broken JSON would take a calculator down.
 """
 
 import gzip
@@ -28,14 +31,12 @@ from datetime import datetime, timezone
 
 EA_START = 1997
 NL_START = 1963
+EE_START = 1990          # the table decides the real start; this only filters junk
 OUT = pathlib.Path(__file__).resolve().parent.parent / "data" / "hicp-anual.json"
 TIMEOUT = 180
 
-GEOS = {"EA": "Euro area", "NL": "Netherlands"}
+GEOS = {"EA": "Euro area", "NL": "Netherlands", "EE": "Estonia"}
 
-# Eurostat retired the old bulk download service (410 Gone) and the statistics/1.0
-# query API with it. Everything now lives under SDMX 2.1. Forms are tried in order so
-# a future move degrades to the next candidate instead of taking the pipeline down.
 EUROSTAT_URLS = [
     "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{ds}?format=TSV&compressed=true",
     "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/{ds}/?format=TSV&compressed=true",
@@ -43,15 +44,23 @@ EUROSTAT_URLS = [
     "https://ec.europa.eu/eurostat/api/dissemination/files/data/{ds}.tsv.gz",
 ]
 
-# CBS OData v3. Periods look like 1963MM01 for months and 1963JJ00 for the year.
 CBS_URL = (
     "https://opendata.cbs.nl/ODataApi/OData/70936ned/TypedDataSet"
     "?$select=Perioden,JaarmutatieCPI_1"
 )
 
+# PxWeb. IA001 is the annual change of the CPI, IA021 the monthly change.
+STAT_EE = "https://andmed.stat.ee/api/v1/et/stat/majandus__hinnad/{table}"
 
-def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "eupf-hicp-data"})
+
+def fetch(url: str, payload: dict = None) -> bytes:
+    """GET, or POST when a payload is given (PxWeb needs POST to return data)."""
+    data = None
+    headers = {"User-Agent": "eupf-hicp-data"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         return resp.read()
 
@@ -91,11 +100,7 @@ def download_tsv(dataset: str) -> str:
 
 
 def parse_tsv(text: str, key: str) -> dict:
-    """Return {period: value} for the row whose dimension key matches exactly.
-
-    Bulk files pack the dimensions into the first column and carry observation
-    flags, so values look like '1.6 p' and ':' marks a missing observation.
-    """
+    """Return {period: value} for the row whose packed dimension key matches."""
     lines = text.strip().split("\n")
     periods = [p.strip() for p in lines[0].split("\t")[1:]]
     out = {}
@@ -118,11 +123,8 @@ def parse_tsv(text: str, key: str) -> dict:
 
 def euro_area() -> tuple:
     annual_raw = parse_tsv(download_tsv("prc_hicp_ainr"), "A,RCH_A_AVG,TOTAL,EA")
-    annual = {
-        y: round(v, 1)
-        for y, v in annual_raw.items()
-        if y.isdigit() and int(y) >= EA_START
-    }
+    annual = {y: round(v, 1) for y, v in annual_raw.items()
+              if y.isdigit() and int(y) >= EA_START}
     if not annual:
         raise RuntimeError("no annual data found for EA")
 
@@ -136,20 +138,17 @@ def euro_area() -> tuple:
                 prov = {year: round(sum(months) / len(months), 1), "months": len(months)}
     except Exception as exc:
         print(f"EA provisional skipped: {exc}", file=sys.stderr)
-
     return annual, prov
 
 
 # --------------------------------------------------------------------- CBS (NL)
 
 def netherlands() -> tuple:
-    raw = json.loads(fetch(CBS_URL).decode("utf-8"))
-    rows = raw.get("value", [])
+    rows = json.loads(fetch(CBS_URL).decode("utf-8")).get("value", [])
     if not rows:
         raise RuntimeError("CBS returned no rows")
 
-    annual = {}
-    monthly = {}
+    annual, monthly = {}, {}
     for row in rows:
         period = (row.get("Perioden") or "").strip()
         value = row.get("JaarmutatieCPI_1")
@@ -170,43 +169,141 @@ def netherlands() -> tuple:
     if year not in annual and monthly.get(year):
         vals = monthly[year]
         prov = {year: round(sum(vals) / len(vals), 1), "months": len(vals)}
-
-    print(f"fetched NL from {CBS_URL}")
+    print("fetched NL from CBS 70936ned")
     return annual, prov
 
 
-# ------------------------------------------------------------------------ main
+# ----------------------------------------------------------- Statistikaamet (EE)
+
+def px_fetch(table: str) -> dict:
+    """PxWeb describes its own tables, so variable codes are discovered rather than
+    hardcoded. Statistics agencies rename these, and a guess that silently selects
+    the wrong series would be worse than a loud failure. The variables are printed
+    so a future break can be diagnosed from the workflow log alone."""
+    meta = json.loads(fetch(STAT_EE.format(table=table)).decode("utf-8"))
+    described = [(v["code"], v.get("text", ""), len(v.get("values", [])))
+                 for v in meta.get("variables", [])]
+    print(f"{table} variables: {described}")
+    payload = {
+        "query": [{"code": v["code"], "selection": {"filter": "all", "values": ["*"]}}
+                  for v in meta.get("variables", [])],
+        "response": {"format": "json-stat2"},
+    }
+    return json.loads(fetch(STAT_EE.format(table=table), payload).decode("utf-8"))
+
+
+def jsonstat_rows(js: dict):
+    """Yield ({dimension: (code, label)}, value) for a json-stat2 response.
+
+    Values arrive in a flat array indexed by a single offset, so the offset is
+    unpacked using the dimension sizes, in the order given by id.
+    """
+    dim_ids = js["id"]
+    sizes = js["size"]
+
+    labels = []
+    for dim in dim_ids:
+        cat = js["dimension"][dim]["category"]
+        index = cat["index"]
+        if isinstance(index, dict):
+            ordered = [None] * len(index)
+            for code, pos in index.items():
+                ordered[pos] = code
+        else:
+            ordered = list(index)
+        label_map = cat.get("label") or {}
+        labels.append([(code, label_map.get(code, code)) for code in ordered])
+
+    strides = [1] * len(sizes)
+    for i in range(len(sizes) - 2, -1, -1):
+        strides[i] = strides[i + 1] * sizes[i + 1]
+
+    values = js["value"]
+    pairs = values.items() if isinstance(values, dict) else enumerate(values)
+    for flat, value in pairs:
+        if value is None:
+            continue
+        rest = int(flat)
+        key = {}
+        for pos, dim in enumerate(dim_ids):
+            idx, rest = divmod(rest, strides[pos])
+            key[dim] = labels[pos][idx]
+        yield key, float(value)
+
+
+def pick_dimension(js: dict, needle: str):
+    for dim in js["id"]:
+        label = str(js["dimension"][dim].get("label") or dim).lower()
+        if needle in label:
+            return dim
+    return None
+
+
+def estonia() -> tuple:
+    js = px_fetch("IA001")
+    time_dim = pick_dimension(js, "aasta") or js["id"][-1]
+
+    annual = {}
+    for key, value in jsonstat_rows(js):
+        code = key[time_dim][0]
+        if code.isdigit() and int(code) >= EE_START:
+            annual[code] = round(value, 1)
+    if not annual:
+        raise RuntimeError("no annual data found for EE")
+
+    prov = {}
+    try:
+        year = str(datetime.now(timezone.utc).year)
+        if year not in annual:
+            jm = px_fetch("IA021")
+            time_dim_m = pick_dimension(jm, "aasta") or jm["id"][0]
+            ind_dim = pick_dimension(jm, "naitaja") or pick_dimension(jm, "n\u00e4itaja")
+            months = []
+            for key, value in jsonstat_rows(jm):
+                if key[time_dim_m][0] != year:
+                    continue
+                # Two indicators share this table: change on the same month of the
+                # previous year, and change on the previous month. Only the first is
+                # comparable with the annual figure.
+                if ind_dim and "eelmise aasta" not in str(key[ind_dim][1]).lower():
+                    continue
+                months.append(value)
+            if months:
+                prov = {year: round(sum(months) / len(months), 1), "months": len(months)}
+    except Exception as exc:
+        print(f"EE provisional skipped: {exc}", file=sys.stderr)
+
+    print("fetched EE from Statistikaamet IA001")
+    return annual, prov
+
+
+# ------------------------------------------------------------------------- main
 
 def main() -> int:
     series, provisional = {}, {}
 
-    try:
-        series["EA"], prov = euro_area()
-        if prov:
-            provisional["EA"] = prov
-    except Exception as exc:
-        print(f"euro area fetch failed: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        series["NL"], prov = netherlands()
-        if prov:
-            provisional["NL"] = prov
-    except Exception as exc:
-        print(f"netherlands fetch failed: {exc}", file=sys.stderr)
-        return 1
+    for geo, fn in (("EA", euro_area), ("NL", netherlands), ("EE", estonia)):
+        try:
+            series[geo], prov = fn()
+            if prov:
+                provisional[geo] = prov
+        except Exception as exc:
+            print(f"{geo} fetch failed: {exc}", file=sys.stderr)
+            return 1
 
     payload = {
         "indicator": "Annual average rate of change of consumer prices (%)",
         "sources": {
             "EA": "Eurostat, HICP, prc_hicp_ainr and prc_hicp_minr, from 1997",
             "NL": "CBS StatLine 70936ned, national CPI (jaarmutatie), from 1963",
+            "EE": "Statistikaamet IA001 and IA021, national CPI (tarbijahinnaindeks)",
         },
         "note": (
-            "EA is the euro area with changing composition. NL uses the CBS national CPI "
-            "rather than the HICP because that is the figure quoted in the Netherlands; "
-            "the two differ materially (2022: 10.0 vs 11.6). Provisional values are the "
-            "mean of the months published so far in the current year."
+            "Each geography uses the index its own readers recognise rather than a "
+            "single harmonised one. EA is the euro area with changing composition "
+            "(HICP). NL and EE use their national CPI, which differs materially from "
+            "the HICP (NL 2022: 10.0 vs 11.6). Provisional values are the mean of the "
+            "months published so far in the current year."
         ),
         "geos": GEOS,
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -219,7 +316,8 @@ def main() -> int:
 
     for geo in GEOS:
         years = sorted(series[geo])
-        print(f"{geo}: {len(years)} years, {years[0]} to {years[-1]}, latest {series[geo][years[-1]]}%")
+        print(f"{geo}: {len(years)} years, {years[0]} to {years[-1]}, "
+              f"latest {series[geo][years[-1]]}%")
     print(f"provisional: {provisional or 'none'}")
     return 0
 

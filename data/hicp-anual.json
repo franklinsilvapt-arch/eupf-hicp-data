@@ -11,7 +11,7 @@
     "NL": "Netherlands",
     "EE": "Estonia"
   },
-  "updated": "2026-09-20T11:01:25Z",
+  "updated": "2026-10-05T14:09:00Z",
   "series": {
     "EA": {
       "1997": 1.6,
@@ -141,8 +141,8 @@
   },
   "provisional": {
     "EA": {
-      "2026": 2.7,
-      "months": 8
+      "2026": 2.8,
+      "months": 9
     },
     "NL": {
       "2026": 2.9,
